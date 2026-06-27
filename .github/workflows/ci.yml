@@ -73,7 +73,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install matching DuckDB CLI
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/v1.5.1/duckdb_cli-linux-amd64.zip
+          wget https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           sudo mv duckdb /usr/local/bin/
           duckdb --version

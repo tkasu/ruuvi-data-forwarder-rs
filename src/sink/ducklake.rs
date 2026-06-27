@@ -113,7 +113,7 @@ fn attach_sql(config: &DuckLakeConfig, data_path: &str) -> Result<String, SinkEr
         ),
     };
     Ok(format!(
-        "ATTACH 'ducklake:{}' AS ducklake (DATA_PATH '{}')",
+        "ATTACH 'ducklake:{}' AS ducklake (DATA_PATH '{}', AUTOMATIC_MIGRATION)",
         sql_string(&catalog),
         data_path
     ))
@@ -207,7 +207,7 @@ mod tests {
         let sql = attach_sql(&config, "/tmp/it's-data").unwrap();
         assert_eq!(
             sql,
-            "ATTACH 'ducklake:postgres:dbname=ruuvi password=''secret''' AS ducklake (DATA_PATH '/tmp/it''s-data')"
+            "ATTACH 'ducklake:postgres:dbname=ruuvi password=''secret''' AS ducklake (DATA_PATH '/tmp/it''s-data', AUTOMATIC_MIGRATION)"
         );
     }
 }
