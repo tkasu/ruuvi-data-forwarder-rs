@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy on every target
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ruuvi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ruuvi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RUUVI_TEST_POSTGRES_URL: host=127.0.0.1 port=5432 dbname=ruuvi_test user=postgres password=postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run complete test suite
+        run: cargo test --all-targets --all-features
+
+  build:
+    name: Release build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --all-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruuvi-data-forwarder-rs
+          path: target/release/ruuvi-data-forwarder-rs
+          retention-days: 7
+
+  integration-tests:
+    name: Binary integration tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install matching DuckDB CLI
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/v1.5.1/duckdb_cli-linux-amd64.zip
+          unzip duckdb_cli-linux-amd64.zip
+          sudo mv duckdb /usr/local/bin/
+          duckdb --version
+      - name: Build release binary
+        run: cargo build --release --all-features
+      - name: Exercise console, DuckDB, and DuckLake binaries
+        run: make test-sinks

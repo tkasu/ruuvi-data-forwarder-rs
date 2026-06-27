@@ -1,0 +1,25 @@
+[pipeline]
+max_write_retries = 3
+initial_retry_delay_ms = 250
+max_retry_delay_ms = 5000
+shutdown_timeout_seconds = 30
+
+[sink]
+sink_type = "console"
+
+[sink.duckdb]
+path = "data/telemetry.db"
+table_name = "telemetry"
+debug_logging = false
+desired_batch_size = 5
+desired_max_batch_latency_seconds = 30
+ducklake_enabled = false
+
+[sink.duckdb.resource_limits]
+# memory_limit = "200MB"
+# threads = 2
+
+[sink.duckdb.ducklake]
+catalog_type = "sqlite"
+catalog_path = "data/ruuvidb.sqlite"
+data_path = "data/ducklake_files/"

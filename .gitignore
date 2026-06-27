@@ -1,0 +1,9 @@
+/target
+data/*.db
+data/*.jsonl
+data/*.sqlite
+data/*.ducklake
+data/ducklake_files/
+data/test_ducklake_files/
+data/test_catalog.ducklake
+test-data.jsonl
