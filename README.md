@@ -54,6 +54,8 @@ Batch size, latency, retry delays, shutdown timeout, memory limits, and thread c
 
 DuckDB and DuckLake use one persistent connection on a dedicated blocking worker. This supports `:memory:` DuckDB and avoids loading and attaching DuckLake for every batch. DuckLake extensions must be available to DuckDB on first use.
 
+DuckLake catalogs are automatically migrated when the bundled DuckDB version requires a newer catalog schema. Deploy the forwarder and maintenance binary from the same release so they use compatible DuckDB and DuckLake versions.
+
 ## DuckLake maintenance
 
 `ruuvi-ducklake-maintenance-rs` runs one maintenance cycle and exits. It sets the explicitly configured snapshot retention and runs DuckLake `CHECKPOINT`, which performs snapshot expiry, file compaction, and old-file cleanup. The streaming forwarder does not run maintenance internally.
