@@ -39,6 +39,7 @@ DuckLake variables:
 - `RUUVI_DUCKDB_DUCKLAKE_CATALOG_TYPE`: `duckdb`, `sqlite`, or `postgres`.
 - `RUUVI_DUCKDB_DUCKLAKE_CATALOG_PATH`: a file path or PostgreSQL connection string.
 - `RUUVI_DUCKDB_DUCKLAKE_DATA_PATH`.
+- `RUUVI_DUCKDB_DUCKLAKE_MAINTENANCE_EXPIRE_OLDER_THAN`: required snapshot retention for the maintenance binary, for example `1 week`.
 
 Batch size, latency, retry delays, shutdown timeout, memory limits, and thread counts are validated at startup.
 
@@ -53,6 +54,63 @@ Batch size, latency, retry delays, shutdown timeout, memory limits, and thread c
 
 DuckDB and DuckLake use one persistent connection on a dedicated blocking worker. This supports `:memory:` DuckDB and avoids loading and attaching DuckLake for every batch. DuckLake extensions must be available to DuckDB on first use.
 
+## DuckLake maintenance
+
+`ruuvi-ducklake-maintenance-rs` runs one maintenance cycle and exits. It sets the explicitly configured snapshot retention and runs DuckLake `CHECKPOINT`, which performs snapshot expiry, file compaction, and old-file cleanup. The streaming forwarder does not run maintenance internally.
+
+Configure retention in the deployment TOML:
+
+```toml
+[sink]
+sink_type = "duckdb"
+
+[sink.duckdb]
+ducklake_enabled = true
+
+[sink.duckdb.ducklake]
+catalog_type = "sqlite"
+catalog_path = "/var/lib/ruuvi/ruuvidb.sqlite"
+data_path = "/var/lib/ruuvi/ducklake_files"
+
+[sink.duckdb.ducklake.maintenance]
+expire_older_than = "1 week"
+```
+
+The catalog and data directory must already exist. SQLite and PostgreSQL catalogs are supported. DuckDB catalogs are rejected because a DuckDB-backed DuckLake permits only one client and cannot safely overlap the forwarder.
+
+Run one cycle with the same deployment configuration as the forwarder:
+
+```bash
+RUUVI_CONFIG_FILE=/etc/ruuvi/forwarder.toml \
+  ./target/release/ruuvi-ducklake-maintenance-rs
+```
+
+A systemd service and timer can schedule non-overlapping runs:
+
+```ini
+# /etc/systemd/system/ruuvi-ducklake-maintenance.service
+[Service]
+Type=oneshot
+Environment=RUUVI_CONFIG_FILE=/etc/ruuvi/forwarder.toml
+ExecStart=/usr/local/bin/ruuvi-ducklake-maintenance-rs
+
+# /etc/systemd/system/ruuvi-ducklake-maintenance.timer
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+For cron, use a lock to prevent overlapping runs:
+
+```cron
+0 * * * * flock -n /run/lock/ruuvi-ducklake-maintenance env RUUVI_CONFIG_FILE=/etc/ruuvi/forwarder.toml /usr/local/bin/ruuvi-ducklake-maintenance-rs
+```
+
+Success exits with status 0. Configuration, catalog locking, extension loading, or maintenance failures return a nonzero status for the scheduler to report or retry.
+
 ## Development
 
 ```bash
@@ -61,5 +119,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo build --release --all-features
 ```
+
+The release build produces `ruuvi-data-forwarder-rs` and `ruuvi-ducklake-maintenance-rs`.
 
 The PostgreSQL DuckLake integration test runs when `RUUVI_TEST_POSTGRES_URL` is set. CI supplies a disposable PostgreSQL instance.

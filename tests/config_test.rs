@@ -16,6 +16,7 @@ fn clean_command(directory: &TempDir) -> Command {
         .env_remove("RUUVI_DUCKDB_DUCKLAKE_CATALOG_TYPE")
         .env_remove("RUUVI_DUCKDB_DUCKLAKE_CATALOG_PATH")
         .env_remove("RUUVI_DUCKDB_DUCKLAKE_DATA_PATH")
+        .env_remove("RUUVI_DUCKDB_DUCKLAKE_MAINTENANCE_EXPIRE_OLDER_THAN")
         .env_remove("RUUVI_DUCKDB_DEBUG_LOGGING")
         .env_remove("RUUVI_DUCKDB_DESIRED_MAX_BATCH_LATENCY_SECONDS")
         .write_stdin("");

@@ -23,3 +23,8 @@ ducklake_enabled = false
 catalog_type = "sqlite"
 catalog_path = "data/ruuvidb.sqlite"
 data_path = "data/ducklake_files/"
+
+# Required only by ruuvi-ducklake-maintenance-rs. There is intentionally no
+# retention default because CHECKPOINT can expire snapshots and delete files.
+# [sink.duckdb.ducklake.maintenance]
+# expire_older_than = "1 week"

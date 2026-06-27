@@ -1,4 +1,4 @@
-.PHONY: help build build-release test lint format clean run create-test-data check-binary test-console-sink test-duckdb-sink test-ducklake-sink test-sinks clean-data clean-test-data clean-ducklake-data
+.PHONY: help build build-release test lint format clean run run-maintenance create-test-data check-binary test-console-sink test-duckdb-sink test-ducklake-sink test-sinks clean-data clean-test-data clean-ducklake-data
 
 BINARY := target/release/ruuvi-data-forwarder-rs
 TEST_DATA := test-data.jsonl
@@ -14,6 +14,7 @@ help:
 	@echo "  make format          - Format code with rustfmt"
 	@echo "  make clean           - Remove build artifacts"
 	@echo "  make run             - Run application (reads from stdin)"
+	@echo "  make run-maintenance - Run one DuckLake maintenance cycle"
 	@echo ""
 	@echo "Integration Testing:"
 	@echo "  make create-test-data       - Create test data file for integration tests"
@@ -49,6 +50,9 @@ clean:
 
 run:
 	cargo run
+
+run-maintenance:
+	cargo run --bin ruuvi-ducklake-maintenance-rs
 
 # Helper target to check if release binary exists
 check-binary:
