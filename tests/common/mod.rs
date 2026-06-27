@@ -14,6 +14,7 @@ pub fn telemetry1() -> RuuviTelemetry {
     }
 }
 
+#[allow(dead_code)]
 pub fn telemetry2() -> RuuviTelemetry {
     RuuviTelemetry {
         battery_potential: 2176,

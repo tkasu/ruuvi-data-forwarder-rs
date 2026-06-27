@@ -102,7 +102,10 @@ fn ducklake_env_configuration_starts_the_ducklake_sink() {
     let directory = TempDir::new().unwrap();
     let catalog_path = directory.path().join("catalog.sqlite");
     let data_path = directory.path().join("ducklake_files");
-    let input = format!("{}\n", serde_json::to_string(&common::telemetry1()).unwrap());
+    let input = format!(
+        "{}\n",
+        serde_json::to_string(&common::telemetry1()).unwrap()
+    );
 
     let output = clean_command(&directory)
         .env("RUUVI_SINK_TYPE", "duckdb")
@@ -116,12 +119,19 @@ fn ducklake_env_configuration_starts_the_ducklake_sink() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Using DuckLake sink"), "stderr: {stderr}");
     assert!(stderr.contains("Catalog type: SQLite"), "stderr: {stderr}");
     assert!(catalog_path.exists(), "catalog file was not created");
-    assert!(data_path.exists(), "ducklake data directory was not created");
+    assert!(
+        data_path.exists(),
+        "ducklake data directory was not created"
+    );
 
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL sqlite; LOAD sqlite;")
