@@ -2,6 +2,7 @@
 name = "ruuvi-data-forwarder-rs"
 version = "0.1.0"
 edition = "2021"
+default-run = "ruuvi-data-forwarder-rs"
 
 [lib]
 name = "ruuvi_data_forwarder_rs"
@@ -10,6 +11,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "ruuvi-data-forwarder-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "ruuvi-ducklake-maintenance-rs"
+path = "src/bin/ruuvi-ducklake-maintenance.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

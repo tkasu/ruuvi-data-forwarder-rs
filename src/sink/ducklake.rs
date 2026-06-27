@@ -77,7 +77,7 @@ impl DuckLakeSink {
         let create_sql = CREATE_TABLE_SQL.replace("{table}", &full_table_name);
         let insert_sql = INSERT_SQL.replace("{table}", &full_table_name);
         let factory = move || {
-            let conn = open_ducklake_connection(&ducklake_config, &resource_limits)?;
+            let conn = open_ducklake_connection(&ducklake_config, &resource_limits, true)?;
             conn.execute_batch(&create_sql)?;
             Ok(conn)
         };
@@ -119,16 +119,31 @@ fn attach_sql(config: &DuckLakeConfig, data_path: &str) -> Result<String, SinkEr
     ))
 }
 
-fn open_ducklake_connection(
+pub(crate) fn open_ducklake_connection(
     config: &DuckLakeConfig,
     limits: &ResourceLimits,
+    create_missing_paths: bool,
 ) -> Result<duckdb::Connection, SinkError> {
     let absolute_data = to_absolute(&config.data_path)?;
-    std::fs::create_dir_all(&absolute_data)?;
+    if create_missing_paths {
+        std::fs::create_dir_all(&absolute_data)?;
+    } else if !absolute_data.is_dir() {
+        return Err(SinkError::ConfigError(format!(
+            "DuckLake data directory does not exist: {}",
+            absolute_data.display()
+        )));
+    }
     if config.catalog_type != CatalogType::Postgres {
         let absolute_catalog = to_absolute(&config.catalog_path)?;
-        if let Some(parent) = absolute_catalog.parent() {
-            std::fs::create_dir_all(parent)?;
+        if create_missing_paths {
+            if let Some(parent) = absolute_catalog.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        } else if !absolute_catalog.is_file() {
+            return Err(SinkError::ConfigError(format!(
+                "DuckLake catalog does not exist: {}",
+                absolute_catalog.display()
+            )));
         }
     }
 

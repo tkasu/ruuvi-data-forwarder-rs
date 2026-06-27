@@ -22,6 +22,12 @@ pub struct DuckLakeConfig {
     pub catalog_type: CatalogTypeCfg,
     pub catalog_path: String,
     pub data_path: String,
+    pub maintenance: Option<DuckLakeMaintenanceConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DuckLakeMaintenanceConfig {
+    pub expire_older_than: String,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -81,6 +87,13 @@ impl Default for PipelineConfig {
 pub struct AppConfig {
     pub sink: SinkConfig,
     pub pipeline: PipelineConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaintenanceSettings {
+    pub ducklake: DuckLakeConfig,
+    pub resource_limits: ResourceLimits,
+    pub expire_older_than: String,
 }
 
 impl AppConfig {
@@ -150,6 +163,40 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn maintenance_settings(&self) -> Result<MaintenanceSettings, ConfigError> {
+        if self.sink.sink_type != SinkType::DuckDB {
+            return invalid("DuckLake maintenance requires sink.sink_type = 'duckdb'");
+        }
+        let db = self.sink.duckdb.as_ref().ok_or_else(|| {
+            ConfigError::Message("DuckDB sink selected but configuration is missing".into())
+        })?;
+        if !db.ducklake_enabled {
+            return invalid("DuckLake maintenance requires sink.duckdb.ducklake_enabled = true");
+        }
+        let ducklake = db.ducklake.as_ref().ok_or_else(|| {
+            ConfigError::Message("DuckLake maintenance configuration is missing".into())
+        })?;
+        if ducklake.catalog_type == CatalogTypeCfg::DuckDB {
+            return invalid(
+                "DuckLake maintenance does not support DuckDB catalogs because they allow only one client; use SQLite or PostgreSQL",
+            );
+        }
+        let maintenance = ducklake.maintenance.as_ref().ok_or_else(|| {
+            ConfigError::Message(
+                "sink.duckdb.ducklake.maintenance.expire_older_than must be configured".into(),
+            )
+        })?;
+        let expire_older_than = maintenance.expire_older_than.trim();
+        if expire_older_than.is_empty() {
+            return invalid("sink.duckdb.ducklake.maintenance.expire_older_than must not be empty");
+        }
+        Ok(MaintenanceSettings {
+            ducklake: ducklake.clone(),
+            resource_limits: db.resource_limits.clone(),
+            expire_older_than: expire_older_than.to_owned(),
+        })
+    }
 }
 
 fn invalid<T>(message: &str) -> Result<T, ConfigError> {
@@ -200,6 +247,10 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     env_override!(
         "RUUVI_DUCKDB_DUCKLAKE_DATA_PATH",
         "sink.duckdb.ducklake.data_path"
+    );
+    env_override!(
+        "RUUVI_DUCKDB_DUCKLAKE_MAINTENANCE_EXPIRE_OLDER_THAN",
+        "sink.duckdb.ducklake.maintenance.expire_older_than"
     );
     env_override!(
         "RUUVI_DUCKDB_MEMORY_LIMIT",
