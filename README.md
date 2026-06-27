@@ -123,3 +123,8 @@ cargo build --release --all-features
 The release build produces `ruuvi-data-forwarder-rs` and `ruuvi-ducklake-maintenance-rs`.
 
 The PostgreSQL DuckLake integration test runs when `RUUVI_TEST_POSTGRES_URL` is set. CI supplies a disposable PostgreSQL instance.
+
+### Potential CI optimizations
+
+- Use a prebuilt DuckDB dynamic library for Clippy and unit tests. This requires making `duckdb/bundled` an application feature, disabling it for those jobs, and setting `DUCKDB_DOWNLOAD_LIB=1`. Release builds should keep the bundled feature enabled, and binary integration tests should continue exercising that bundled release artifact.
+- Tune cross-job Rust caching if repeat builds remain slow. `Swatinem/rust-cache` includes the GitHub job ID in its cache key by default, so a `shared-key` or `add-job-id-key: false` may improve reuse across later workflow runs. Concurrent jobs cannot consume a cache produced during the same run, so build artifacts should still be passed explicitly between dependent jobs.
