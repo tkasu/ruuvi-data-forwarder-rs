@@ -313,6 +313,98 @@ async fn test_in_memory_database_persists_across_worker_commands() {
     sink.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn test_shutdown_is_idempotent() {
+    let sink = DuckDBSink::new(":memory:", "telemetry", 5, 30, ResourceLimits::default()).unwrap();
+    sink.initialize().await.unwrap();
+    sink.write_batch(Arc::from(vec![common::telemetry1()]))
+        .await
+        .unwrap();
+    sink.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_repeated_create_write_drop_without_shutdown() {
+    // Dropping a sink without shutdown() must still stop and join the worker
+    // thread so its DuckDB connection cannot race process teardown.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("churn.db");
+    for _ in 0..10 {
+        let sink = DuckDBSink::new(
+            db_path.to_str().unwrap(),
+            "telemetry",
+            5,
+            30,
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        sink.initialize().await.unwrap();
+        sink.write_batch(Arc::from(vec![common::telemetry1()]))
+            .await
+            .unwrap();
+        drop(sink);
+    }
+    let count = count_records(db_path.to_str().unwrap(), "telemetry");
+    assert_eq!(count, 10);
+}
+
+#[tokio::test]
+async fn test_failed_write_reconnects_on_next_attempt() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("reconnect.db");
+
+    // Pre-create the table with a CHECK constraint the sink's own DDL lacks,
+    // so a write can be made to fail deterministically.
+    {
+        let conn = duckdb::Connection::open(db_path.to_str().unwrap()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE telemetry (
+                temperature_millicelsius INTEGER NOT NULL,
+                humidity INTEGER NOT NULL CHECK (humidity > 0),
+                pressure INTEGER NOT NULL,
+                battery_potential INTEGER NOT NULL,
+                tx_power INTEGER NOT NULL,
+                movement_counter INTEGER NOT NULL,
+                measurement_sequence_number INTEGER NOT NULL,
+                measurement_ts_ms BIGINT NOT NULL,
+                mac_address VARCHAR NOT NULL
+            )",
+        )
+        .unwrap();
+    }
+
+    let sink = DuckDBSink::new(
+        db_path.to_str().unwrap(),
+        "telemetry",
+        5,
+        30,
+        ResourceLimits::default(),
+    )
+    .unwrap();
+    sink.initialize().await.unwrap();
+
+    let mut invalid = common::telemetry1();
+    invalid.humidity = -1;
+    let error = sink
+        .write_batch(Arc::from(vec![invalid]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ruuvi_data_forwarder_rs::error::SinkError::DuckDBError(_)
+    ));
+
+    // The worker recycled its connection; the next write must succeed.
+    sink.write_batch(Arc::from(vec![common::telemetry2()]))
+        .await
+        .unwrap();
+    sink.shutdown().await.unwrap();
+
+    let records = read_records(db_path.to_str().unwrap(), "telemetry");
+    assert_eq!(records, vec![common::telemetry2()]);
+}
+
 #[test]
 fn test_reject_zero_batch_settings() {
     assert!(DuckDBSink::new(":memory:", "telemetry", 0, 30, ResourceLimits::default()).is_err());

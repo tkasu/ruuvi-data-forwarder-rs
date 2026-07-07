@@ -29,7 +29,7 @@ This utility serves as the data processing and routing layer by:
 - **Configuration:** config crate 0.14 (TOML file + env var overrides)
 - **Logging:** tracing + tracing-subscriber (env-filter, writes to stderr)
 - **Error Handling:** thiserror 2 (derive macros for error types)
-- **Streaming:** tokio-stream (LinesStream for stdin), futures
+- **Streaming:** tokio-stream + tokio-util (length-capped `LinesCodec` for stdin), futures
 - **Build Tool:** Cargo
 
 ### Project Structure
@@ -45,27 +45,37 @@ ruuvi-data-forwarder-rs/
 │   ├── ci.yml                   # Lint, Test, Build, Integration Tests
 │   └── claude.yml               # Claude Code Action
 ├── config/
-│   └── default.toml             # Default configuration
+│   └── default.toml             # Default configuration (also embedded in the binary)
 ├── data/
 │   └── .gitkeep                 # Keep data directory in git
+├── perf_test.sh                 # Single DuckLake performance run
+├── perf_matrix.sh               # RPS x batch-size performance matrix
 ├── test-data.jsonl              # Test data for integration tests
 ├── src/
-│   ├── main.rs                  # Entry point + sink selection
+│   ├── main.rs                  # Forwarder entry point + sink selection
 │   ├── lib.rs                   # Public module exports
+│   ├── bin/
+│   │   └── ruuvi-ducklake-maintenance.rs  # One-shot DuckLake maintenance binary
 │   ├── config.rs                # Config structs + TOML loading + env var overrides
 │   ├── dto.rs                   # RuuviTelemetry struct with serde
-│   ├── error.rs                 # SourceError + SinkError (thiserror)
-│   ├── source.rs                # stdin_source() using tokio BufReader + LinesStream
-│   ├── pipeline.rs              # deadline batching, retries, and graceful shutdown
+│   ├── error.rs                 # SourceError + SinkError + PipelineError (thiserror)
+│   ├── maintenance.rs           # DuckLake snapshot expiry + CHECKPOINT
+│   ├── source.rs                # stdin_source() with line-length cap + validation
+│   ├── pipeline.rs              # deadline batching, retries, and bounded graceful shutdown
 │   └── sink/
 │       ├── mod.rs               # SensorValuesSink trait
 │       ├── console.rs           # ConsoleSink (JSON to stdout)
 │       ├── duckdb.rs            # DuckDBSink (file-based, batch insert)
-│       └── ducklake.rs          # DuckLakeSink (in-memory DuckDB + ATTACH)
+│       ├── ducklake.rs          # DuckLakeSink (in-memory DuckDB + ATTACH)
+│       └── worker.rs            # DatabaseWorker (dedicated blocking DB thread)
 └── tests/
-    ├── console_test.rs          # Console pass-through (binary subprocess)
-    ├── duckdb_test.rs           # 8 DuckDB tests
-    └── ducklake_test.rs         # 3 DuckLake tests
+    ├── common/mod.rs            # Shared telemetry fixtures
+    ├── config_test.rs           # Config precedence, validation, unknown-key rejection
+    ├── console_test.rs          # Console pass-through + broken-pipe (binary subprocess)
+    ├── duckdb_test.rs           # DuckDB sink + worker lifecycle tests
+    ├── ducklake_test.rs         # DuckLake sink tests (DuckDB/SQLite/Postgres catalogs)
+    ├── maintenance_test.rs      # Maintenance binary tests (incl. snapshot expiry)
+    └── pipeline_test.rs         # Batching, retry, and shutdown tests (paused clock)
 ```
 
 ### Key Components
@@ -74,7 +84,11 @@ ruuvi-data-forwarder-rs/
 - Initializes `tracing_subscriber` with env filter (defaults to "info", writes to stderr)
 - Loads config via `load_config()`
 - Matches on `sink_type` to construct the appropriate sink
-- Creates `stdin_source()` and runs `run_pipeline(source, sink)`
+- Redacts PostgreSQL catalog paths in startup logs (connection strings may carry credentials)
+- Creates `stdin_source()` and runs `run_pipeline_until(source, sink, config, shutdown_signal())`
+- Exits via `std::process::exit` after the pipeline finishes: tokio's stdin uses an
+  uncancellable blocking read, and letting the runtime drop would hang exit while the
+  input pipe is open but idle
 
 **src/dto.rs** - Data model
 - `RuuviTelemetry` struct: 9 fields matching Ruuvi RAWv2 format
@@ -85,7 +99,11 @@ ruuvi-data-forwarder-rs/
 
 **src/error.rs** - Error types
 - `SourceError`: `ParseError(String)`, `StreamShutdown`, `IoError`
-- `SinkError`: `IoError`, `DuckDBError`, `InvalidTableName`, `ConfigError`, `JoinError`
+- `SinkError`: `IoError`, `DuckDBError`, `TransactionOutcomeUnknown`, `InvalidTableName`,
+  `ConfigError`, `SerializationError`, `WorkerUnavailable`, `WorkerFailed`
+- `PipelineError`: `Source`, `Sink`, `ShutdownTimeout`
+- `SinkError::is_retryable()`: DuckDB errors and transient IO errors retry;
+  `BrokenPipe`/`UnexpectedEof` and unknown transaction outcomes do not
 - Uses `thiserror` for `Display`/`Error` derives
 
 **src/sink/mod.rs** - Sink trait
@@ -94,6 +112,7 @@ ruuvi-data-forwarder-rs/
 pub trait SensorValuesSink: Send + Sync {
     async fn write_batch(&self, batch: Arc<[RuuviTelemetry]>) -> Result<(), SinkError>;
     async fn initialize(&self) -> Result<(), SinkError> { Ok(()) }
+    async fn shutdown(&self) -> Result<(), SinkError> { Ok(()) }
     fn desired_batch_size(&self) -> usize;
     fn desired_max_batch_latency(&self) -> Duration;
 }
@@ -126,10 +145,23 @@ pub trait SensorValuesSink: Send + Sync {
 - All table refs prefixed with `ducklake.` (e.g., `ducklake.telemetry`)
 - Same schema and batch logic as DuckDB sink
 
+**src/sink/worker.rs** - Database worker
+- `DatabaseWorker`: a dedicated blocking OS thread owns one DuckDB connection per sink
+- Commands (`Initialize`, `Write`, `Shutdown`) are sent over a channel; responses via oneshot
+- A failed write drops the cached connection so a retried write reconnects through the factory
+- `shutdown()` is idempotent and joins the thread; a `Drop` fallback also stops and joins it
+  so process exit never races native DuckDB teardown
+
+**src/maintenance.rs + src/bin/ruuvi-ducklake-maintenance.rs** - DuckLake maintenance
+- One-shot binary: sets `expire_older_than` (persisted in the catalog) and runs `CHECKPOINT`
+- Requires a SQLite or PostgreSQL catalog (DuckDB catalogs allow only one client)
+- Requires existing catalog/data paths; never creates storage
+
 **src/source.rs** - Stdin source
 - `stdin_source()`: returns `impl Stream<Item = Result<RuuviTelemetry, SourceError>>`
-- Uses `tokio::io::BufReader + LinesStream`
-- Parses each line as JSON, yields `SourceError::ParseError` on failure
+- Length-capped line framing (`MAX_LINE_BYTES` = 64 KiB); an oversized line is discarded,
+  reported as `ParseError`, and the stream recovers at the next newline
+- Parses each line as JSON and validates `mac_address` (exactly 6 elements, each 0..=255)
 - Yields `SourceError::StreamShutdown` when stdin closes
 
 **src/pipeline.rs** - Batching pipeline
@@ -137,15 +169,22 @@ pub trait SensorValuesSink: Send + Sync {
 - Deadline-based grouping using `tokio::select!`:
   - Start a deadline when the first record enters an empty batch
   - Stream item: add to batch and flush if `>= batch_size`
-  - Parse errors: log and continue
-  - Stream shutdown: flush remaining batch, break
-  - Deadline, EOF, or shutdown: flush if non-empty
+  - Parse errors: log and continue (rate-limited after the first few)
+  - Stream shutdown / EOF: flush remaining batch, close the sink, exit
   - Retry safe sink failures with bounded exponential backoff
+- Shutdown is observed during initialization, in-flight writes, and retry sleeps;
+  a single absolute deadline (`shutdown_timeout_seconds`) is armed when the signal
+  arrives and bounds all remaining work (`PipelineError::ShutdownTimeout` on overrun)
+- A source I/O error flushes buffered records best-effort before returning the source error
+- Every error exit performs a time-bounded best-effort sink shutdown
 
 **src/config.rs** - Configuration
-- Loads `config/default.toml` via `config` crate
+- Embedded defaults (`include_str!` of `config/default.toml`) overlaid by an optional
+  `config/default` file in the CWD, then `RUUVI_CONFIG_FILE`, then `RUUVI_*` env vars
 - Explicit env var overrides for each `RUUVI_*` variable (no HOCON `${?ENV}` equivalent)
+- All config structs use `#[serde(deny_unknown_fields)]`: typo'd keys fail startup
 - `SinkType`: `Console`, `DuckDB` (lowercase in TOML via serde rename_all)
+- `validate()` checks batch settings, retry delays, resource limits, and DuckLake paths
 
 ## Data Format
 
@@ -322,22 +361,21 @@ make clean-ducklake-data
 ```
 
 **Test Coverage:**
-- Unit and integration coverage for configuration, console, pipeline, DuckDB, and DuckLake
-- `dto::tests::test_mac_address_hex` - MAC address hex formatting
-- `console_sink_passes_through_values` - Console sink binary subprocess test
-- `duckdb_test` - 8 tests:
-  - Write and read back telemetry (verify all fields)
-  - Create database file and table automatically
-  - Create parent directories for nested DB path
-  - Append to existing database
-  - Reject invalid table names (SQL injection protection)
-  - Batch 10 records efficiently
-  - Insert 3 records in single batch
-  - Pipeline batching by size and time (timeout-based flush)
-- `ducklake_test` - 3 tests:
-  - Write with DuckDB catalog, read back and verify
-  - Append to existing DuckLake catalog
-  - Relative path resolution
+- Unit tests: MAC hex formatting, config defaults, error retryability, source
+  parsing/validation (line cap, MAC shape), DuckDB rollback and resource limits
+- `console_test` - pass-through and broken-pipe handling (binary subprocess)
+- `config_test` - config precedence (embedded/file/env), validation failures,
+  unknown-key rejection, DuckLake env startup
+- `pipeline_test` - batching by size and latency (paused clock), retry recovery
+  and exhaustion, unknown-transaction handling, shutdown flush, shutdown during
+  hung initialization/writes, source-failure flush
+- `duckdb_test` - write/read-back, file and directory creation, append,
+  invalid table names, batching, idempotent shutdown, drop-without-shutdown churn,
+  reconnect after a failed write
+- `ducklake_test` - DuckDB/SQLite catalogs, append, relative paths, and a
+  PostgreSQL catalog test gated on `RUUVI_TEST_POSTGRES_URL`
+- `maintenance_test` - checkpoint run, snapshot expiry, retention validation,
+  DuckDB-catalog rejection, missing-path handling, SQL-injection resistance
 
 ## Configuration
 
@@ -345,6 +383,12 @@ Configuration is loaded from `config/default.toml` with environment variable ove
 
 **Default Configuration (`config/default.toml`):**
 ```toml
+[pipeline]
+max_write_retries = 3
+initial_retry_delay_ms = 250
+max_retry_delay_ms = 5000
+shutdown_timeout_seconds = 30
+
 [sink]
 sink_type = "console"
 
@@ -356,16 +400,29 @@ desired_batch_size = 5
 desired_max_batch_latency_seconds = 30
 ducklake_enabled = false
 
+[sink.duckdb.resource_limits]
+# memory_limit = "200MB"
+# threads = 2
+
 [sink.duckdb.ducklake]
-catalog_type = "duckdb"
-catalog_path = "data/catalog.ducklake"
+catalog_type = "sqlite"
+catalog_path = "data/ruuvidb.sqlite"
 data_path = "data/ducklake_files/"
+
+# Required only by ruuvi-ducklake-maintenance-rs.
+# [sink.duckdb.ducklake.maintenance]
+# expire_older_than = "1 week"
 ```
 
 **Environment Variables:**
 
 Core:
 - `RUUVI_SINK_TYPE` - Sink type: `console` or `duckdb`
+- `RUUVI_CONFIG_FILE` - Optional TOML deployment configuration (must exist if set)
+
+Pipeline:
+- `RUUVI_MAX_WRITE_RETRIES`, `RUUVI_INITIAL_RETRY_DELAY_MS`, `RUUVI_MAX_RETRY_DELAY_MS`
+- `RUUVI_SHUTDOWN_TIMEOUT_SECONDS` - Bound on flush/close work after a shutdown signal
 
 DuckDB (Standard Mode):
 - `RUUVI_DUCKDB_PATH` - Path to DuckDB database file
@@ -373,12 +430,17 @@ DuckDB (Standard Mode):
 - `RUUVI_DUCKDB_DEBUG_LOGGING` - Enable/disable debug logging (`true`/`false`)
 - `RUUVI_DUCKDB_DESIRED_BATCH_SIZE` - Number of records per batch
 - `RUUVI_DUCKDB_DESIRED_MAX_BATCH_LATENCY_SECONDS` - Max seconds before flushing batch
+- `RUUVI_DUCKDB_MEMORY_LIMIT` - DuckDB memory limit, e.g. `200MB`
+- `RUUVI_DUCKDB_THREADS` - DuckDB thread count
 
 DuckLake (Lakehouse Mode):
 - `RUUVI_DUCKDB_DUCKLAKE_ENABLED` - Enable DuckLake mode (`true`/`false`)
 - `RUUVI_DUCKDB_DUCKLAKE_CATALOG_TYPE` - Catalog database: `duckdb`, `sqlite`, or `postgres`
 - `RUUVI_DUCKDB_DUCKLAKE_CATALOG_PATH` - Path to catalog database file (or connection string for PostgreSQL)
 - `RUUVI_DUCKDB_DUCKLAKE_DATA_PATH` - Directory for Parquet data files
+- `RUUVI_DUCKDB_DUCKLAKE_MAINTENANCE_EXPIRE_OLDER_THAN` - Snapshot retention for the
+  maintenance binary, e.g. `1 week`. Persisted in the catalog by `set_option`, so it
+  also applies to any other client that runs `CHECKPOINT`
 
 **DuckLake Catalog Database Options:**
 - **DuckDB**: Single-client, file-based. Best for local single-process usage.

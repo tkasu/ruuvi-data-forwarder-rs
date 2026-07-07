@@ -21,6 +21,7 @@ struct RecordingSink {
     write_failures: AtomicUsize,
     uncertain_failure: AtomicBool,
     hang_writes: AtomicBool,
+    hang_initialize: AtomicBool,
 }
 
 impl RecordingSink {
@@ -36,6 +37,7 @@ impl RecordingSink {
             write_failures: AtomicUsize::new(0),
             uncertain_failure: AtomicBool::new(false),
             hang_writes: AtomicBool::new(false),
+            hang_initialize: AtomicBool::new(false),
         }
     }
 
@@ -48,6 +50,9 @@ impl RecordingSink {
 impl SensorValuesSink for RecordingSink {
     async fn initialize(&self) -> Result<(), SinkError> {
         self.initialize_calls.fetch_add(1, Ordering::SeqCst);
+        if self.hang_initialize.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.initialize_failures.load(Ordering::SeqCst) > 0 {
             self.initialize_failures.fetch_sub(1, Ordering::SeqCst);
             return Err(Self::retryable_error());
@@ -255,6 +260,74 @@ async fn shutdown_flushes_pending_batch() {
     tokio::time::advance(Duration::from_millis(1)).await;
     task.await.unwrap().unwrap();
     assert_eq!(sink.batches.lock().unwrap().len(), 1);
+    assert_eq!(sink.shutdown_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_hung_initialization_times_out() {
+    let sink = Arc::new(RecordingSink::new(5, Duration::from_secs(30)));
+    sink.hang_initialize.store(true, Ordering::SeqCst);
+    let task_sink = Arc::clone(&sink);
+    let task = tokio::spawn(async move {
+        run_pipeline_until(
+            futures::stream::pending(),
+            task_sink.as_ref(),
+            &fast_config(),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(error, PipelineError::ShutdownTimeout));
+    assert_eq!(sink.initialize_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_hung_write_times_out() {
+    let sink = Arc::new(RecordingSink::new(1, Duration::from_secs(30)));
+    sink.hang_writes.store(true, Ordering::SeqCst);
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    sender.send(Ok(common::telemetry1())).await.unwrap();
+    let task_sink = Arc::clone(&sink);
+    let task = tokio::spawn(async move {
+        run_pipeline_until(
+            receiver_stream(receiver),
+            task_sink.as_ref(),
+            &fast_config(),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+    });
+    // The size-triggered write is already hung when the shutdown signal fires.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(error, PipelineError::ShutdownTimeout));
+    assert_eq!(sink.write_calls.load(Ordering::SeqCst), 1);
+    drop(sender);
+}
+
+#[tokio::test]
+async fn source_io_error_flushes_buffered_records() {
+    let sink = RecordingSink::new(10, Duration::from_secs(30));
+    let source = tokio_stream::iter(vec![
+        Ok(common::telemetry1()),
+        Ok(common::telemetry2()),
+        Err(SourceError::IoError(std::io::Error::other("stdin failed"))),
+    ]);
+    let error = run_pipeline_with_config(source, &sink, &fast_config())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PipelineError::Source(SourceError::IoError(_))
+    ));
+    assert_eq!(
+        sink.batches.lock().unwrap().as_slice(),
+        &[vec![common::telemetry1(), common::telemetry2()]]
+    );
     assert_eq!(sink.shutdown_calls.load(Ordering::SeqCst), 1);
 }
 

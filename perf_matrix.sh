@@ -44,18 +44,26 @@ printf "%-5s  %-10s  %-8s  %-10s  %-10s  %-10s  %-9s  %-9s  %-9s  %-6s\n" \
     "RPS" "BatchSize" "Dur(s)" "RSS_min" "RSS_max" "RSS_avg" "CPU_min" "CPU_max" "CPU_avg" "Rows"
 printf '%0.s-' {1..100}; echo
 
+ERR_FILE=$(mktemp /tmp/ruuvi_perf_matrix_XXXXXX)
+trap 'rm -f "$ERR_FILE"' EXIT
+
 for rps in "${RPSS[@]}"; do
     for batch in "${BATCH_SIZES[@]}"; do
         dur=$(calc_duration "$rps" "$batch")
         printf "  [running RPS=%-2s batch=%-4s dur=%-3ss]...\r" "$rps" "$batch" "$dur" >&2
 
-        csv=$(bash perf_test.sh \
+        if ! csv=$(bash perf_test.sh \
             --rps "$rps" \
             --duration "$dur" \
             --batch-size "$batch" \
             --latency "$BATCH_LATENCY" \
             "${LIMIT_ARGS[@]}" \
-            --csv 2>/dev/null)
+            --csv 2>"$ERR_FILE"); then
+            echo "" >&2
+            echo "ERROR: perf_test.sh failed for RPS=$rps batch=$batch:" >&2
+            cat "$ERR_FILE" >&2
+            exit 1
+        fi
 
         IFS=',' read -r _rps _batch _dur rss_min rss_max rss_avg cpu_min cpu_max cpu_avg rows <<< "$csv"
 

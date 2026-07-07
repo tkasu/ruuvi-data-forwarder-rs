@@ -8,8 +8,10 @@ use crate::sink::duckdb::{
 use crate::sink::worker::DatabaseWorker;
 use crate::sink::SensorValuesSink;
 use async_trait::async_trait;
+use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,8 +158,30 @@ pub(crate) fn open_ducklake_connection(
         CatalogType::DuckDB => {}
     }
     let sql = attach_sql(config, &absolute_data.to_string_lossy())?;
-    conn.execute_batch(&sql)?;
+    conn.execute_batch(&sql)
+        .map_err(|error| attach_error(error, config))?;
     Ok(conn)
+}
+
+static PASSWORD_KV_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)password\s*=\s*\S+").expect("valid password regex"));
+static URI_CREDENTIALS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"://[^/@\s]+@").expect("valid URI credentials regex"));
+
+/// DuckDB embeds the ATTACH target verbatim in its error messages; for
+/// PostgreSQL catalogs that is a connection string that may carry credentials.
+/// Scrub it before the error reaches logs, keeping the error retryable.
+fn attach_error(error: duckdb::Error, config: &DuckLakeConfig) -> SinkError {
+    if config.catalog_type != CatalogType::Postgres {
+        return SinkError::DuckDBError(error);
+    }
+    let message = error.to_string().replace(
+        &config.catalog_path,
+        "<postgres connection string redacted>",
+    );
+    let message = PASSWORD_KV_RE.replace_all(&message, "password=<redacted>");
+    let message = URI_CREDENTIALS_RE.replace_all(&message, "://<redacted>@");
+    SinkError::DatabaseError(message.into_owned())
 }
 
 #[async_trait]
@@ -196,6 +220,30 @@ impl SensorValuesSink for DuckLakeSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_attach_errors_are_redacted() {
+        let config = DuckLakeConfig {
+            catalog_type: CatalogType::Postgres,
+            catalog_path: "dbname=ruuvi user=admin password=SuperSecret123".into(),
+            data_path: "unused".into(),
+        };
+        let raw = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some(
+                "Failed to attach at \"postgres:dbname=ruuvi user=admin password=SuperSecret123\": \
+                 could not connect to postgresql://admin:SuperSecret123@localhost/ruuvi"
+                    .into(),
+            ),
+        );
+        let redacted = attach_error(raw, &config);
+        let message = redacted.to_string();
+        assert!(
+            !message.contains("SuperSecret123"),
+            "password leaked: {message}"
+        );
+        assert!(redacted.is_retryable());
+    }
 
     #[test]
     fn postgres_attach_uses_catalog_prefix_and_escapes_literals() {

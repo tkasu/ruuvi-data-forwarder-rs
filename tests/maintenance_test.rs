@@ -57,6 +57,27 @@ fn sql_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
 
+fn snapshot_count(catalog: &std::path::Path, data: &std::path::Path) -> i64 {
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL sqlite; LOAD sqlite;")
+        .unwrap();
+    connection
+        .execute_batch(&format!(
+            "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}')",
+            sql_path(catalog),
+            sql_path(data)
+        ))
+        .unwrap();
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM ducklake_snapshots('ducklake')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 #[test]
 fn checkpoint_runs_against_an_existing_sqlite_ducklake() {
     let directory = TempDir::new().unwrap();
@@ -74,6 +95,53 @@ fn checkpoint_runs_against_an_existing_sqlite_ducklake() {
         .stderr(predicate::str::contains("DuckLake maintenance completed"));
 
     assert_eq!(row_count(&catalog, &data), 1);
+}
+
+#[test]
+fn checkpoint_expires_old_snapshots() {
+    let directory = TempDir::new().unwrap();
+    let (catalog, data) = seed_ducklake(&directory);
+
+    // Additional inserts create additional snapshots.
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("INSTALL ducklake; LOAD ducklake; INSTALL sqlite; LOAD sqlite;")
+        .unwrap();
+    connection
+        .execute_batch(&format!(
+            "ATTACH 'ducklake:sqlite:{}' AS ducklake (DATA_PATH '{}'); \
+             INSERT INTO ducklake.telemetry VALUES (2); \
+             INSERT INTO ducklake.telemetry VALUES (3);",
+            sql_path(&catalog),
+            sql_path(&data)
+        ))
+        .unwrap();
+    drop(connection);
+
+    let before = snapshot_count(&catalog, &data);
+    assert!(before >= 3, "expected at least 3 snapshots, got {before}");
+
+    // Age every snapshot past the retention used below.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    maintenance_command(&directory)
+        .env("RUUVI_DUCKDB_DUCKLAKE_CATALOG_PATH", &catalog)
+        .env("RUUVI_DUCKDB_DUCKLAKE_DATA_PATH", &data)
+        .env(
+            "RUUVI_DUCKDB_DUCKLAKE_MAINTENANCE_EXPIRE_OLDER_THAN",
+            "1 second",
+        )
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("DuckLake maintenance completed"));
+
+    let after = snapshot_count(&catalog, &data);
+    assert!(
+        after < before,
+        "expected snapshots to be expired: before={before}, after={after}"
+    );
+    // The latest state must survive expiry.
+    assert_eq!(row_count(&catalog, &data), 3);
 }
 
 #[test]
