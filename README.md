@@ -60,6 +60,8 @@ DuckLake catalogs are automatically migrated when the bundled DuckDB version req
 
 `ruuvi-ducklake-maintenance-rs` runs one maintenance cycle and exits. It sets the explicitly configured snapshot retention and runs DuckLake `CHECKPOINT`, which performs snapshot expiry, file compaction, and old-file cleanup. The streaming forwarder does not run maintenance internally.
 
+Note that `expire_older_than` is stored in the catalog by `ducklake.set_option`, so it persists beyond the maintenance run: any client that later runs `CHECKPOINT` against the same catalog applies the same retention. Keep the configured retention identical across deployments sharing a catalog.
+
 Configure retention in the deployment TOML:
 
 ```toml

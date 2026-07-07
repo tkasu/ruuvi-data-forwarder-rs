@@ -41,8 +41,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Derived values
-SLEEP_INTERVAL=$(awk "BEGIN { printf \"%.6f\", 1/$RPS }")
+# Validate numeric arguments before they reach arithmetic or awk.
+for arg_check in "rps:$RPS" "duration:$DURATION" "batch-size:$BATCH_SIZE" "latency:$BATCH_LATENCY"; do
+    name="${arg_check%%:*}"
+    value="${arg_check#*:}"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: --$name must be a positive integer, got: $value" >&2
+        exit 1
+    fi
+done
+
+# Derived values (LC_ALL=C keeps the decimal separator a dot for `sleep`)
+SLEEP_INTERVAL=$(LC_ALL=C awk "BEGIN { printf \"%.6f\", 1/$RPS }")
 
 BINARY="target/release/ruuvi-data-forwarder-rs"
 TEST_EVENT='{"battery_potential":2335,"humidity":653675,"measurement_ts_ms":1693460525701,"mac_address":[254,38,136,122,102,102],"measurement_sequence_number":53300,"movement_counter":2,"pressure":100755,"temperature_millicelsius":-29020,"tx_power":4}'
@@ -51,7 +61,6 @@ TEST_EVENT='{"battery_potential":2335,"humidity":653675,"measurement_ts_ms":1693
 RUN_ID="${RPS}_${BATCH_SIZE}_$$"
 CATALOG_PATH="data/perf_test_${RUN_ID}_catalog.ducklake"
 DATA_PATH="data/perf_test_${RUN_ID}_ducklake/"
-LOG_FILE="/tmp/ruuvi_perf_${RUN_ID}.log"
 
 if ! $CSV_OUTPUT; then
 echo "=== Ruuvi DuckLake Performance Test ==="
@@ -68,16 +77,31 @@ fi
 # Cleanup previous test artifacts
 rm -f "$CATALOG_PATH"
 rm -rf "$DATA_PATH"
-rm -f "$LOG_FILE"
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at $BINARY. Run 'make build-release' first."
     exit 1
 fi
 
-# Create a named pipe for stdin
-FIFO=$(mktemp -u /tmp/ruuvi_perf_XXXXXX)
+# Create the named pipe and log inside a securely created temporary directory
+# so the exit trap cleans everything up together.
+TMP_DIR=$(mktemp -d /tmp/ruuvi_perf_XXXXXX)
+FIFO="$TMP_DIR/stdin.fifo"
+LOG_FILE="$TMP_DIR/forwarder.log"
 mkfifo "$FIFO"
+
+BINARY_PID=""
+cleanup() {
+    exec 3>&- 2>/dev/null || true
+    if [[ -n "$BINARY_PID" ]] && kill -0 "$BINARY_PID" 2>/dev/null; then
+        kill "$BINARY_PID" 2>/dev/null || true
+        wait "$BINARY_PID" 2>/dev/null || true
+    fi
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Start the binary (conditionally set resource limits)
 env_args=(
@@ -107,7 +131,6 @@ sleep 0.5
 if ! kill -0 "$BINARY_PID" 2>/dev/null; then
     echo "ERROR: Binary failed to start. Log:"
     cat "$LOG_FILE"
-    rm -f "$FIFO"
     exit 1
 fi
 
@@ -130,9 +153,9 @@ while true; do
     echo "$TEST_EVENT" >&3
     EVENTS_SENT=$((EVENTS_SENT + 1))
 
-    # Sample metrics
+    # Sample metrics (LC_ALL=C keeps ps decimal separators as dots)
     if kill -0 "$BINARY_PID" 2>/dev/null; then
-        read -r RSS VSZ CPU <<< "$(ps -p "$BINARY_PID" -o rss=,vsz=,pcpu= 2>/dev/null || echo '0 0 0')"
+        read -r RSS VSZ CPU <<< "$(LC_ALL=C ps -p "$BINARY_PID" -o rss=,vsz=,pcpu= 2>/dev/null || echo '0 0 0')"
         RSS_SAMPLES+=("${RSS:-0}")
         VSZ_SAMPLES+=("${VSZ:-0}")
         CPU_SAMPLES+=("${CPU:-0}")
@@ -151,21 +174,28 @@ $CSV_OUTPUT || echo ""
 $CSV_OUTPUT || echo "Closing stdin (sending EOF)..."
 exec 3>&-
 
-wait "$BINARY_PID" 2>/dev/null || true
+BINARY_STATUS=0
+wait "$BINARY_PID" || BINARY_STATUS=$?
+BINARY_PID=""
 END_TIME=$(date +%s)
-rm -f "$FIFO"
+
+if (( BINARY_STATUS != 0 )); then
+    echo "ERROR: Forwarder exited with status $BINARY_STATUS. Log:" >&2
+    tail -20 "$LOG_FILE" >&2 2>/dev/null || true
+    exit 1
+fi
 
 TOTAL_TIME=$((END_TIME - START_TIME))
 
 # ---- Statistics ----
 
-# Integer stats (RSS, VSZ in KB)
+# Integer stats (RSS, VSZ in KB). Takes samples as arguments:
+# macOS ships bash 3.2, which has no nameref (`local -n`).
 int_stats() {
-    local -n arr=$1
-    local count=${#arr[@]}
+    local count=$#
     (( count == 0 )) && { echo "0 0 0"; return; }
-    local min="${arr[0]}" max="${arr[0]}" sum=0
-    for v in "${arr[@]}"; do
+    local min=$1 max=$1 sum=0 v
+    for v in "$@"; do
         (( v < min )) && min=$v
         (( v > max )) && max=$v
         sum=$((sum + v))
@@ -173,23 +203,35 @@ int_stats() {
     echo "$min $max $((sum / count))"
 }
 
-read -r RSS_MIN RSS_MAX RSS_AVG <<< "$(int_stats RSS_SAMPLES)"
-read -r VSZ_MIN VSZ_MAX VSZ_AVG <<< "$(int_stats VSZ_SAMPLES)"
+read -r RSS_MIN RSS_MAX RSS_AVG <<< "$(int_stats "${RSS_SAMPLES[@]}")"
+read -r VSZ_MIN VSZ_MAX VSZ_AVG <<< "$(int_stats "${VSZ_SAMPLES[@]}")"
 
-CPU_STATS=$(printf '%s\n' "${CPU_SAMPLES[@]:-0}" | awk '
+CPU_STATS=$(printf '%s\n' "${CPU_SAMPLES[@]:-0}" | LC_ALL=C awk '
     NR==1 { min=$1; max=$1; sum=$1; n=1 }
     NR>1  { if($1<min) min=$1; if($1>max) max=$1; sum+=$1; n++ }
     END   { if(n>0) printf "%.1f %.1f %.1f", min, max, sum/n; else print "0 0 0" }
 ')
 read -r CPU_MIN CPU_MAX CPU_AVG <<< "$CPU_STATS"
 
-# Row count verification
-ROW_COUNT="?"
-if command -v duckdb &>/dev/null && [ -f "$CATALOG_PATH" ]; then
-    ROW_COUNT=$(duckdb :memory: -csv -noheader -c \
-        "INSTALL ducklake; LOAD ducklake; \
-         ATTACH 'ducklake:$(pwd)/${CATALOG_PATH}' AS dl (DATA_PATH '$(pwd)/${DATA_PATH}'); \
-         SELECT COUNT(*) FROM dl.telemetry;" 2>/dev/null || echo "?")
+# Row count verification: a missing CLI, missing catalog, or count mismatch is a failure.
+if ! command -v duckdb &>/dev/null; then
+    echo "ERROR: duckdb CLI not found; cannot verify row count" >&2
+    exit 1
+fi
+if [ ! -f "$CATALOG_PATH" ]; then
+    echo "ERROR: catalog was not created: $CATALOG_PATH" >&2
+    exit 1
+fi
+ROW_COUNT=$(duckdb :memory: -csv -noheader -c \
+    "INSTALL ducklake; LOAD ducklake; \
+     ATTACH 'ducklake:$(pwd)/${CATALOG_PATH}' AS dl (DATA_PATH '$(pwd)/${DATA_PATH}'); \
+     SELECT COUNT(*) FROM dl.telemetry;") || {
+    echo "ERROR: failed to read row count from DuckLake" >&2
+    exit 1
+}
+if [ "$ROW_COUNT" != "$EVENTS_SENT" ]; then
+    echo "ERROR: row count mismatch: sent $EVENTS_SENT events, found $ROW_COUNT rows" >&2
+    exit 1
 fi
 
 if $CSV_OUTPUT; then

@@ -66,7 +66,6 @@ fn console_broken_pipe_returns_an_error_without_panicking() {
     let mut child =
         std::process::Command::new(assert_cmd::cargo::cargo_bin!("ruuvi-data-forwarder-rs"))
             .env("RUUVI_SINK_TYPE", "console")
-            .env("RUUVI_MAX_WRITE_RETRIES", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

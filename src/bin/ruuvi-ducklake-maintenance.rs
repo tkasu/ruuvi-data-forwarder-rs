@@ -1,6 +1,6 @@
-use ruuvi_data_forwarder_rs::config::{load_config, CatalogTypeCfg};
+use ruuvi_data_forwarder_rs::config::load_config;
 use ruuvi_data_forwarder_rs::maintenance::run_ducklake_maintenance;
-use ruuvi_data_forwarder_rs::sink::ducklake::{CatalogType, DuckLakeConfig};
+use ruuvi_data_forwarder_rs::sink::ducklake::DuckLakeConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
@@ -15,13 +15,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let settings = config
         .maintenance_settings()
         .map_err(|error| format!("Invalid maintenance config: {error}"))?;
-    let catalog_type = match settings.ducklake.catalog_type {
-        CatalogTypeCfg::DuckDB => CatalogType::DuckDB,
-        CatalogTypeCfg::SQLite => CatalogType::SQLite,
-        CatalogTypeCfg::Postgres => CatalogType::Postgres,
-    };
     let ducklake = DuckLakeConfig {
-        catalog_type,
+        catalog_type: settings.ducklake.catalog_type.into(),
         catalog_path: settings.ducklake.catalog_path,
         data_path: settings.ducklake.data_path,
     };

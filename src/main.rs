@@ -1,4 +1,4 @@
-use ruuvi_data_forwarder_rs::config::{load_config, ResourceLimits, SinkType};
+use ruuvi_data_forwarder_rs::config::{load_config, CatalogTypeCfg, ResourceLimits, SinkType};
 use ruuvi_data_forwarder_rs::sink::console::ConsoleSink;
 use ruuvi_data_forwarder_rs::sink::duckdb::DuckDBSink;
 use ruuvi_data_forwarder_rs::sink::ducklake::{DuckLakeConfig, DuckLakeSink};
@@ -45,7 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .ok_or("DuckLake enabled but ducklake configuration is missing")?;
                 tracing::info!("Using DuckLake sink");
                 tracing::info!("Catalog type: {:?}", dl_cfg.catalog_type);
-                tracing::info!("Catalog path: {}", dl_cfg.catalog_path);
+                // Postgres catalog paths are connection strings that may carry credentials.
+                if dl_cfg.catalog_type == CatalogTypeCfg::Postgres {
+                    tracing::info!("Catalog path: <postgres connection string redacted>");
+                } else {
+                    tracing::info!("Catalog path: {}", dl_cfg.catalog_path);
+                }
                 tracing::info!("Data path: {}", dl_cfg.data_path);
                 tracing::info!("Table name: {}", duckdb_cfg.table_name);
                 tracing::info!("Batch size: {}", duckdb_cfg.desired_batch_size);
@@ -88,15 +93,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let source = ruuvi_data_forwarder_rs::source::stdin_source();
-    ruuvi_data_forwarder_rs::pipeline::run_pipeline_until(
+    let result = ruuvi_data_forwarder_rs::pipeline::run_pipeline_until(
         source,
         sink.as_ref(),
         &cfg.pipeline,
         shutdown_signal(),
     )
-    .await?;
+    .await;
 
-    Ok(())
+    // tokio's stdin performs an uncancellable blocking read; letting main return
+    // would make the runtime drop wait on that read, hanging exit while the input
+    // pipe is open but idle. All batches are flushed and the database worker is
+    // joined by this point, so exit immediately instead.
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            tracing::error!("Pipeline failed: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(unix)]

@@ -16,6 +16,8 @@ pub enum SinkError {
     IoError(#[from] std::io::Error),
     #[error("DuckDB error: {0}")]
     DuckDBError(#[from] duckdb::Error),
+    #[error("database error: {0}")]
+    DatabaseError(String),
     #[error("transaction outcome is unknown after commit or rollback failed: {0}")]
     TransactionOutcomeUnknown(String),
     #[error("Invalid table name '{0}': expected a letter or underscore followed by alphanumeric characters or underscores")]
@@ -32,7 +34,33 @@ pub enum SinkError {
 
 impl SinkError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::IoError(_) | Self::DuckDBError(_))
+        match self {
+            // A closed pipe or truncated stream is permanent; retrying only
+            // delays the exit of the process.
+            Self::IoError(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+            ),
+            Self::DuckDBError(_) | Self::DatabaseError(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_pipe_and_eof_are_not_retryable() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(!SinkError::IoError(std::io::Error::from(kind)).is_retryable());
+        }
+        assert!(SinkError::IoError(std::io::Error::other("transient")).is_retryable());
+        assert!(!SinkError::TransactionOutcomeUnknown("commit failed".into()).is_retryable());
     }
 }
 

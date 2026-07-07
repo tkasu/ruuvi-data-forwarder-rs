@@ -76,6 +76,30 @@ fn environment_overrides_explicit_file() {
 }
 
 #[test]
+fn unknown_configuration_keys_are_rejected() {
+    // A typo must fail startup instead of silently keeping an embedded default.
+    let cases = [
+        "[pipelinee]\nmax_write_retries = 1\n",
+        "[pipeline]\nmax_write_retriess = 1\n",
+        "[sink]\nsink_typee = \"console\"\n",
+        "[sink.duckdb]\npathh = \"x.db\"\n",
+        "[sink.duckdb.resource_limits]\nmemory_limitt = \"64MB\"\n",
+        "[sink.duckdb.ducklake]\ncatalog_pathh = \"x.sqlite\"\n",
+        "[sink.duckdb.ducklake.maintenance]\nexpire_older_thann = \"1 week\"\n",
+    ];
+    for contents in cases {
+        let directory = TempDir::new().unwrap();
+        let config_path = directory.path().join("deployment.toml");
+        std::fs::write(&config_path, contents).unwrap();
+        clean_command(&directory)
+            .env("RUUVI_CONFIG_FILE", &config_path)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unknown field"));
+    }
+}
+
+#[test]
 fn missing_explicit_config_file_is_fatal() {
     let directory = TempDir::new().unwrap();
     clean_command(&directory)

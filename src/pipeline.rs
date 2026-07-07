@@ -3,6 +3,7 @@ use crate::dto::RuuviTelemetry;
 use crate::error::{PipelineError, SinkError, SourceError};
 use crate::sink::SensorValuesSink;
 use futures::{future, Future, Stream};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -29,8 +30,19 @@ pub async fn run_pipeline_until(
     config: &PipelineConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), PipelineError> {
-    retry_initialize(sink, config).await?;
+    let result = pipeline_loop(source, sink, config, shutdown).await;
+    if result.is_err() {
+        cleanup_after_failure(sink, Duration::from_secs(config.shutdown_timeout_seconds)).await;
+    }
+    result
+}
 
+async fn pipeline_loop(
+    source: impl Stream<Item = Result<RuuviTelemetry, SourceError>>,
+    sink: &dyn SensorValuesSink,
+    config: &PipelineConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), PipelineError> {
     let batch_size = sink.desired_batch_size();
     let max_latency = sink.desired_max_batch_latency();
     if batch_size == 0 || max_latency.is_zero() {
@@ -39,23 +51,41 @@ pub async fn run_pipeline_until(
         )));
     }
 
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut deadline: Option<Instant> = None;
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_seconds);
     tokio::pin!(source);
     tokio::pin!(shutdown);
+    // Armed once a shutdown is requested; every later await is bounded by it.
+    // After it is set the shutdown future is never polled again.
+    let mut shutdown_deadline: Option<Instant> = None;
+
+    bounded(
+        retry_initialize(sink, config),
+        shutdown.as_mut(),
+        &mut shutdown_deadline,
+        shutdown_timeout,
+    )
+    .await?;
+
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut deadline: Option<Instant> = None;
+    let mut parse_errors: u64 = 0;
 
     loop {
+        if shutdown_deadline.is_some() {
+            tracing::info!("Shutdown requested; flushing pending telemetry");
+            return finish(
+                &mut batch,
+                sink,
+                config,
+                shutdown.as_mut(),
+                &mut shutdown_deadline,
+                shutdown_timeout,
+            )
+            .await;
+        }
         tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("Shutdown requested; flushing pending telemetry");
-                let timeout = Duration::from_secs(config.shutdown_timeout_seconds);
-                tokio::time::timeout(timeout, async {
-                    flush(&mut batch, sink, config).await?;
-                    sink.shutdown().await.map_err(PipelineError::Sink)
-                })
-                .await
-                .map_err(|_| PipelineError::ShutdownTimeout)??;
-                return Ok(());
+            _ = shutdown.as_mut() => {
+                shutdown_deadline = Some(Instant::now() + shutdown_timeout);
             }
             item = source.next() => {
                 match item {
@@ -65,29 +95,142 @@ pub async fn run_pipeline_until(
                         }
                         batch.push(telemetry);
                         if batch.len() >= batch_size {
-                            flush(&mut batch, sink, config).await?;
+                            bounded(
+                                flush(&mut batch, sink, config),
+                                shutdown.as_mut(),
+                                &mut shutdown_deadline,
+                                shutdown_timeout,
+                            )
+                            .await?;
                             deadline = None;
                         }
                     }
                     Some(Err(SourceError::ParseError(message))) => {
-                        tracing::error!("Error parsing telemetry: {message}");
+                        parse_errors += 1;
+                        // A garbage stream must not flood the log: after the
+                        // first few errors, report only every hundredth.
+                        if parse_errors <= 10 || parse_errors.is_multiple_of(100) {
+                            tracing::error!(
+                                "Error parsing telemetry (error #{parse_errors}): {message}"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Error parsing telemetry (error #{parse_errors}): {message}"
+                            );
+                        }
                     }
                     Some(Err(SourceError::StreamShutdown)) | None => {
-                        flush(&mut batch, sink, config).await?;
-                        sink.shutdown().await?;
                         tracing::info!("Stream completed - shutting down");
-                        return Ok(());
+                        return finish(
+                            &mut batch,
+                            sink,
+                            config,
+                            shutdown.as_mut(),
+                            &mut shutdown_deadline,
+                            shutdown_timeout,
+                        )
+                        .await;
                     }
                     Some(Err(error @ SourceError::IoError(_))) => {
+                        tracing::error!("Source failed: {error}; flushing buffered telemetry");
+                        if let Err(flush_error) = bounded(
+                            flush(&mut batch, sink, config),
+                            shutdown.as_mut(),
+                            &mut shutdown_deadline,
+                            shutdown_timeout,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Flushing buffered telemetry after source failure failed: {flush_error}"
+                            );
+                        }
                         return Err(PipelineError::Source(error));
                     }
                 }
             }
             _ = wait_for_deadline(deadline), if deadline.is_some() => {
-                flush(&mut batch, sink, config).await?;
+                bounded(
+                    flush(&mut batch, sink, config),
+                    shutdown.as_mut(),
+                    &mut shutdown_deadline,
+                    shutdown_timeout,
+                )
+                .await?;
                 deadline = None;
             }
         }
+    }
+}
+
+/// Flush the remaining batch and close the sink, bounded by the shutdown
+/// deadline once a shutdown has been requested.
+async fn finish<S: Future<Output = ()>>(
+    batch: &mut Vec<RuuviTelemetry>,
+    sink: &dyn SensorValuesSink,
+    config: &PipelineConfig,
+    mut shutdown: Pin<&mut S>,
+    shutdown_deadline: &mut Option<Instant>,
+    shutdown_timeout: Duration,
+) -> Result<(), PipelineError> {
+    bounded(
+        flush(batch, sink, config),
+        shutdown.as_mut(),
+        shutdown_deadline,
+        shutdown_timeout,
+    )
+    .await?;
+    bounded(
+        async { sink.shutdown().await.map_err(PipelineError::Sink) },
+        shutdown.as_mut(),
+        shutdown_deadline,
+        shutdown_timeout,
+    )
+    .await
+}
+
+/// Await `op` while also watching for a shutdown request. Once shutdown is
+/// requested (in this call or an earlier one), the operation is bounded by a
+/// single absolute deadline shared across the pipeline and aborts with
+/// `ShutdownTimeout` when the deadline passes. An abandoned in-flight database
+/// command cannot be cancelled mid-call; its outcome is unknown, matching the
+/// semantics of `SinkError::TransactionOutcomeUnknown`.
+async fn bounded<S>(
+    op: impl Future<Output = Result<(), PipelineError>>,
+    mut shutdown: Pin<&mut S>,
+    shutdown_deadline: &mut Option<Instant>,
+    shutdown_timeout: Duration,
+) -> Result<(), PipelineError>
+where
+    S: Future<Output = ()>,
+{
+    tokio::pin!(op);
+    if shutdown_deadline.is_none() {
+        tokio::select! {
+            result = &mut op => return result,
+            _ = &mut shutdown => {
+                *shutdown_deadline = Some(Instant::now() + shutdown_timeout);
+                tracing::info!(
+                    "Shutdown requested; bounding in-flight work by {}s",
+                    shutdown_timeout.as_secs()
+                );
+            }
+        }
+    }
+    let deadline = shutdown_deadline.expect("shutdown deadline must be set");
+    match tokio::time::timeout_at(deadline, &mut op).await {
+        Ok(result) => result,
+        Err(_) => Err(PipelineError::ShutdownTimeout),
+    }
+}
+
+/// Best-effort, time-bounded sink cleanup after a pipeline failure so the
+/// database worker is joined even on error exits.
+async fn cleanup_after_failure(sink: &dyn SensorValuesSink, timeout: Duration) {
+    match tokio::time::timeout(timeout, sink.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("Sink cleanup after pipeline failure failed: {error}"),
+        Err(_) => tracing::warn!("Sink cleanup after pipeline failure timed out"),
     }
 }
 

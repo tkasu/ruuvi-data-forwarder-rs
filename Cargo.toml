@@ -17,9 +17,19 @@ name = "ruuvi-ducklake-maintenance-rs"
 path = "src/bin/ruuvi-ducklake-maintenance.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "signal",
+    "time",
+    "sync",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Crate ~1.10504.0 encodes libduckdb 1.5.4; keep DUCKDB_CLI_VERSION in
+# .github/workflows/ci.yml in sync when bumping.
 duckdb = { version = "~1.10504.0", features = ["bundled"] }
 config = "0.14"
 tracing = "0.1"
@@ -27,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 regex = "1"
 tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -34,6 +45,4 @@ async-trait = "0.1"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
-duckdb = { version = "~1.10504.0", features = ["bundled"] }
-tokio = { version = "1", features = ["full", "test-util"] }
-tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio = { version = "1", features = ["test-util"] }

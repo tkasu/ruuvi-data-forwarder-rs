@@ -18,6 +18,7 @@ pub enum SinkType {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DuckLakeConfig {
     pub catalog_type: CatalogTypeCfg,
     pub catalog_path: String,
@@ -26,6 +27,7 @@ pub struct DuckLakeConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DuckLakeMaintenanceConfig {
     pub expire_older_than: String,
 }
@@ -39,12 +41,14 @@ pub enum CatalogTypeCfg {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     pub memory_limit: Option<String>,
     pub threads: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DuckDBConfig {
     pub path: String,
     pub table_name: String,
@@ -59,12 +63,14 @@ pub struct DuckDBConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     pub sink_type: SinkType,
     pub duckdb: Option<DuckDBConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub max_write_retries: u32,
     pub initial_retry_delay_ms: u64,
@@ -84,6 +90,7 @@ impl Default for PipelineConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub sink: SinkConfig,
     pub pipeline: PipelineConfig,
